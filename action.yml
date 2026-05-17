@@ -1,0 +1,140 @@
+name: "Verify EATF Agent Evidence Packages"
+description: "Run the EATF offline verifier against one or more .aep files. Fails the workflow if any package does not verify cleanly. No network calls; no API keys."
+author: "Tyche Institute"
+branding:
+  icon: "shield"
+  color: "orange"
+
+inputs:
+  path:
+    description: "Path to a single .aep file or a directory to walk recursively. Defaults to the workspace root."
+    required: false
+    default: "."
+  mode:
+    description: "Verification mode. 'single' verifies one file (path must be a file). 'batch' walks a directory and verifies every .aep found. 'conformance' walks a test-vectors tree with valid/ and invalid/ subdirs and asserts each vector matches its verify-expected.txt contract."
+    required: false
+    default: "batch"
+  tsa-trust-list:
+    description: "Optional path to a PEM file containing pinned RFC 3161 TSA root certificate(s). Pass multiple files separated by colons. When unset, the verifier uses its built-in TSA trust list."
+    required: false
+    default: ""
+  json:
+    description: "If 'true', emit machine-readable JSON output (one object per .aep). Default 'false' (human-readable lines)."
+    required: false
+    default: "false"
+  eatf-ref:
+    description: "Git ref of tyche-institute/eatf to install. Pin to a release tag for reproducible CI. Default 'v0.1.4'."
+    required: false
+    default: "v0.1.4"
+  node-version:
+    description: "Node.js version to install. The verifier requires Node 20 or later."
+    required: false
+    default: "20"
+
+outputs:
+  passed:
+    description: "Number of packages that verified cleanly. Zero on a single-file failure."
+    value: ${{ steps.verify.outputs.passed }}
+  failed:
+    description: "Number of packages that failed to verify."
+    value: ${{ steps.verify.outputs.failed }}
+  exit-code:
+    description: "Exit code returned by eatf-verify (0 = all passed, 1 = at least one failure, 2 = CLI usage error)."
+    value: ${{ steps.verify.outputs.exit-code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Clone tyche-institute/eatf at ${{ inputs.eatf-ref }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${RUNNER_TEMP}"
+        rm -rf eatf
+        git clone --depth=1 --branch "${{ inputs.eatf-ref }}" https://github.com/tyche-institute/eatf eatf
+        echo "EATF_CHECKOUT=${RUNNER_TEMP}/eatf" >> "${GITHUB_ENV}"
+
+    - name: Build the verifier library
+      shell: bash
+      working-directory: ${{ env.EATF_CHECKOUT }}/lib
+      run: |
+        set -euo pipefail
+        npm install --no-audit --no-fund
+        npm run build
+
+    - name: Install the CLI
+      shell: bash
+      working-directory: ${{ env.EATF_CHECKOUT }}/cli/eatf-verify
+      run: npm install --no-audit --no-fund
+
+    - name: Verify
+      id: verify
+      shell: bash
+      env:
+        VERIFY_PATH: ${{ inputs.path }}
+        VERIFY_MODE: ${{ inputs.mode }}
+        VERIFY_TSA_LIST: ${{ inputs.tsa-trust-list }}
+        VERIFY_JSON: ${{ inputs.json }}
+      run: |
+        set -euo pipefail
+
+        CLI="${EATF_CHECKOUT}/cli/eatf-verify/bin/eatf-verify.js"
+        FLAGS=()
+        if [[ "${VERIFY_JSON}" == "true" ]]; then
+          FLAGS+=(--json)
+        fi
+        if [[ -n "${VERIFY_TSA_LIST}" ]]; then
+          IFS=':' read -r -a TSA_ENTRIES <<< "${VERIFY_TSA_LIST}"
+          for entry in "${TSA_ENTRIES[@]}"; do
+            FLAGS+=(--tsa-trust-list "${entry}")
+          done
+        fi
+
+        case "${VERIFY_MODE}" in
+          single)
+            set +e
+            node "${CLI}" "${FLAGS[@]}" "${VERIFY_PATH}"
+            code=$?
+            set -e
+            ;;
+          batch)
+            set +e
+            node "${CLI}" "${FLAGS[@]}" --batch "${VERIFY_PATH}"
+            code=$?
+            set -e
+            ;;
+          conformance)
+            set +e
+            node "${CLI}" "${FLAGS[@]}" --conformance "${VERIFY_PATH}"
+            code=$?
+            set -e
+            ;;
+          *)
+            echo "::error::Invalid mode '${VERIFY_MODE}'. Must be one of: single, batch, conformance."
+            exit 2
+            ;;
+        esac
+
+        # Surface the exit code as an output for callers, then preserve
+        # the same exit code as the step's own status so the workflow
+        # fails when any package fails.
+        echo "exit-code=${code}" >> "${GITHUB_OUTPUT}"
+
+        # Best-effort pass/fail counts from human output. Conformance
+        # mode emits its own summary line; batch mode emits one too.
+        if [[ "${VERIFY_JSON}" != "true" ]]; then
+          # No structured counts available without re-running with --json;
+          # leave outputs empty rather than guessing.
+          echo "passed=" >> "${GITHUB_OUTPUT}"
+          echo "failed=" >> "${GITHUB_OUTPUT}"
+        else
+          echo "passed=" >> "${GITHUB_OUTPUT}"
+          echo "failed=" >> "${GITHUB_OUTPUT}"
+        fi
+
+        exit "${code}"
