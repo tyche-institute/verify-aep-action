@@ -77,17 +77,17 @@ jobs:
           path: ./my-vectors/
 ```
 
-## What this Action does NOT do
+## Design guarantees
 
-- **No sign-then-verify.** Pair with the `eatf-sign` CLI directly
-  in the workflow if you want to produce `.aep` packages from CI.
-  This Action is verify-only by design.
-- **No remote verification queries.** All work happens on the
-  runner. The Action never contacts `api.eatf.eu` or any
+- **Verify-only by design.** The Action asserts evidence; pair it
+  with the `eatf-sign` CLI in the same workflow to produce `.aep`
+  packages from CI.
+- **Fully local.** All verification happens on the runner's
+  filesystem; the Action never contacts `api.eatf.eu` or any
   registry.
-- **No notification side effects.** The Action does not post
-  comments, status checks, or summaries. Use it inside a job
-  that has its own annotation strategy.
+- **Side-effect-free.** The Action reports through the step's
+  exit status alone, so comments, status checks, and summaries
+  stay fully under your job's own annotation strategy.
 
 ## Versioning
 
