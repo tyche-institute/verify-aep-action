@@ -1,0 +1,93 @@
+name: Self-test
+
+# Runs the Action from this checkout against the public reference
+# test vectors of tyche-institute/eatf-verifier.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch the reference test vectors
+        uses: actions/checkout@v7
+        with:
+          repository: tyche-institute/eatf-verifier
+          ref: v0.7.4
+          path: vectors-src
+
+      - name: conformance mode meets the contract on the reference vectors
+        uses: ./
+        with:
+          mode: conformance
+          path: vectors-src/test-vectors
+
+      - name: batch mode passes on the valid vectors
+        uses: ./
+        with:
+          mode: batch
+          path: vectors-src/test-vectors/valid
+
+      - name: single mode passes on one valid package, JSON output
+        uses: ./
+        with:
+          mode: single
+          json: "true"
+          path: vectors-src/test-vectors/valid/minimal-roundtrip/package.aep
+
+      - name: single mode rejects a tampered package
+        id: tampered
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: single
+          path: vectors-src/test-vectors/invalid/tampered-canonical-bin/package.aep
+
+      - name: The tampered package must have failed the step
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.tampered.outcome }}
+          EXIT_CODE: ${{ steps.tampered.outputs.exit-code }}
+        run: |
+          echo "outcome=${OUTCOME} exit-code=${EXIT_CODE}"
+          test "${OUTCOME}" = "failure"
+          test "${EXIT_CODE}" = "1"
+
+      - name: batch mode fails when a tree holds rejected packages
+        id: mixed
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: batch
+          path: vectors-src/test-vectors
+
+      - name: The mixed tree must have failed the step
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.mixed.outcome }}
+        run: |
+          echo "outcome=${OUTCOME}"
+          test "${OUTCOME}" = "failure"
+
+  legacy-layout:
+    # v0.1.x releases of the verifier have separate packages for the
+    # library and the CLI; the Action keeps an install path for them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: conformance mode on a v0.1.x release, with its own vectors
+        uses: ./
+        with:
+          eatf-ref: v0.1.2
+          mode: conformance
+          path: ${{ runner.temp }}/eatf-verifier/test-vectors
