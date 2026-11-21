@@ -11,11 +11,11 @@ inputs:
     required: false
     default: "."
   mode:
-    description: "Verification mode. 'single' verifies one file (path must be a file). 'batch' walks a directory and verifies every .aep found. 'conformance' walks a test-vectors tree with valid/ and invalid/ subdirs and asserts each vector matches its verify-expected.txt contract."
+    description: "Verification mode. 'single' verifies one file (path must be a file). 'batch' walks a directory and verifies every .aep found. 'conformance' walks a test-vectors tree with valid/ and invalid/ subdirs and asserts that every package under valid/ verifies and every package under invalid/ is rejected."
     required: false
     default: "batch"
   tsa-trust-list:
-    description: "Optional path to a PEM file containing pinned RFC 3161 TSA root certificate(s). Pass multiple files separated by colons. When unset, the verifier uses its built-in TSA trust list."
+    description: "Optional path to a PEM file with root certificate(s) for the verifier's advisory issuer-name pin on the RFC 3161 timestamp signer (not RFC 5280 path validation). Pass multiple files separated by colons. When unset, no issuer-name comparison is made."
     required: false
     default: ""
   json:
@@ -23,9 +23,9 @@ inputs:
     required: false
     default: "false"
   eatf-ref:
-    description: "Git ref of tyche-institute/eatf to install. Pin to a release tag for reproducible CI. Default 'v0.1.4'."
+    description: "Release tag of tyche-institute/eatf-verifier to install. Pin to a release tag for reproducible CI. Default 'v0.7.4'."
     required: false
-    default: "v0.1.4"
+    default: "v0.7.4"
   node-version:
     description: "Node.js version to install. The verifier requires Node 20 or later."
     required: false
@@ -50,27 +50,32 @@ runs:
       with:
         node-version: ${{ inputs.node-version }}
 
-    - name: Clone tyche-institute/eatf at ${{ inputs.eatf-ref }}
+    - name: Clone tyche-institute/eatf-verifier at ${{ inputs.eatf-ref }}
       shell: bash
+      env:
+        EATF_REF: ${{ inputs.eatf-ref }}
       run: |
         set -euo pipefail
         cd "${RUNNER_TEMP}"
-        rm -rf eatf
-        git clone --depth=1 --branch "${{ inputs.eatf-ref }}" https://github.com/tyche-institute/eatf eatf
-        echo "EATF_CHECKOUT=${RUNNER_TEMP}/eatf" >> "${GITHUB_ENV}"
+        rm -rf eatf-verifier
+        git clone --depth=1 --branch "${EATF_REF}" https://github.com/tyche-institute/eatf-verifier eatf-verifier
+        echo "EATF_CHECKOUT=${RUNNER_TEMP}/eatf-verifier" >> "${GITHUB_ENV}"
 
-    - name: Build the verifier library
+    - name: Install and build the verifier
       shell: bash
-      working-directory: ${{ env.EATF_CHECKOUT }}/lib
       run: |
         set -euo pipefail
-        npm install --no-audit --no-fund
-        npm run build
-
-    - name: Install the CLI
-      shell: bash
-      working-directory: ${{ env.EATF_CHECKOUT }}/cli/eatf-verify
-      run: npm install --no-audit --no-fund
+        cd "${EATF_CHECKOUT}"
+        if [[ -f package-lock.json ]]; then
+          # v0.2.0 and later: one npm workspace with a single lock file
+          # at the repository root.
+          npm ci --no-audit --no-fund
+          npm run build
+        else
+          # v0.1.x: the library and the CLI are separate packages.
+          (cd lib && npm install --no-audit --no-fund && npm run build)
+          (cd cli/eatf-verify && npm install --no-audit --no-fund)
+        fi
 
     - name: Verify
       id: verify
