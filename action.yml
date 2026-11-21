@@ -46,9 +46,11 @@ runs:
   using: "composite"
   steps:
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7
       with:
         node-version: ${{ inputs.node-version }}
+        # Do not cache the caller's dependencies as a side effect.
+        package-manager-cache: false
 
     - name: Clone tyche-institute/eatf-verifier at ${{ inputs.eatf-ref }}
       shell: bash
