@@ -18,6 +18,10 @@ inputs:
     description: "Optional path to a PEM file with root certificate(s) for the verifier's advisory issuer-name pin on the RFC 3161 timestamp signer (not RFC 5280 path validation). Pass multiple files separated by colons. When unset, no issuer-name comparison is made."
     required: false
     default: ""
+  signer-key:
+    description: "Optional path to a PEM file with the RSA public key that must have signed every package: one PUBLIC KEY block, as 'openssl pkey -pubout' writes it. Passed to the verifier as --signer-key; a package whose embedded signer key differs is rejected. Pass multiple files separated by colons; a package passes when its key matches any of them. When unset, the signature is checked against the key embedded in the package, which does not establish who signed. Needs eatf-verifier v0.2.0 or later."
+    required: false
+    default: ""
   json:
     description: "If 'true', emit machine-readable JSON output (one object per .aep). Default 'false' (human-readable lines)."
     required: false
@@ -27,19 +31,19 @@ inputs:
     required: false
     default: "v0.7.4"
   node-version:
-    description: "Node.js version to install. The verifier requires Node 20 or later."
+    description: "Node.js version to install. Default '24', a Node.js LTS line. The verifier's engines field asks for Node 20 or later; Node 20 is past its end of life."
     required: false
-    default: "20"
+    default: "24"
 
 outputs:
   passed:
-    description: "Number of packages that verified cleanly. Zero on a single-file failure."
+    description: "Number of packages that verified: one count per package the verifier reported. In conformance mode, the packages the verifier accepted."
     value: ${{ steps.verify.outputs.passed }}
   failed:
-    description: "Number of packages that failed to verify."
+    description: "Number of packages that did not verify. In conformance mode, every package the verifier rejected, including the expected rejections under invalid/."
     value: ${{ steps.verify.outputs.failed }}
   exit-code:
-    description: "Exit code returned by eatf-verify (0 = all passed, 1 = at least one failure, 2 = CLI usage error)."
+    description: "Exit code returned by eatf-verify (0 = all passed, or the conformance contract was met; 1 = at least one failure or contract mismatch; 2 = usage error, unreadable file, or a conformance tree with no vectors)."
     value: ${{ steps.verify.outputs.exit-code }}
 
 runs:
@@ -86,6 +90,7 @@ runs:
         VERIFY_PATH: ${{ inputs.path }}
         VERIFY_MODE: ${{ inputs.mode }}
         VERIFY_TSA_LIST: ${{ inputs.tsa-trust-list }}
+        VERIFY_SIGNER_KEYS: ${{ inputs.signer-key }}
         VERIFY_JSON: ${{ inputs.json }}
       run: |
         set -euo pipefail
@@ -101,47 +106,64 @@ runs:
             FLAGS+=(--tsa-trust-list "${entry}")
           done
         fi
+        if [[ -n "${VERIFY_SIGNER_KEYS}" ]]; then
+          IFS=':' read -r -a SIGNER_ENTRIES <<< "${VERIFY_SIGNER_KEYS}"
+          for entry in "${SIGNER_ENTRIES[@]}"; do
+            FLAGS+=(--signer-key "${entry}")
+          done
+        fi
 
         case "${VERIFY_MODE}" in
-          single)
-            set +e
-            node "${CLI}" "${FLAGS[@]}" "${VERIFY_PATH}"
-            code=$?
-            set -e
-            ;;
-          batch)
-            set +e
-            node "${CLI}" "${FLAGS[@]}" --batch "${VERIFY_PATH}"
-            code=$?
-            set -e
-            ;;
-          conformance)
-            set +e
-            node "${CLI}" "${FLAGS[@]}" --conformance "${VERIFY_PATH}"
-            code=$?
-            set -e
-            ;;
+          single) TARGET=("${VERIFY_PATH}") ;;
+          batch) TARGET=(--batch "${VERIFY_PATH}") ;;
+          conformance) TARGET=(--conformance "${VERIFY_PATH}") ;;
           *)
             echo "::error::Invalid mode '${VERIFY_MODE}'. Must be one of: single, batch, conformance."
+            printf 'exit-code=2\npassed=0\nfailed=0\n' >> "${GITHUB_OUTPUT}"
             exit 2
             ;;
         esac
+
+        # The verifier's report goes to the log and to a file; the
+        # counts below are read from that file.
+        REPORT="$(mktemp "${RUNNER_TEMP}/eatf-verify-report.XXXXXX")"
+        set +e
+        node "${CLI}" "${FLAGS[@]}" "${TARGET[@]}" | tee "${REPORT}"
+        code=${PIPESTATUS[0]}
+        set -e
 
         # Surface the exit code as an output for callers, then preserve
         # the same exit code as the step's own status so the workflow
         # fails when any package fails.
         echo "exit-code=${code}" >> "${GITHUB_OUTPUT}"
 
-        # Best-effort pass/fail counts from human output. Conformance
-        # mode emits its own summary line; batch mode emits one too.
-        if [[ "${VERIFY_JSON}" != "true" ]]; then
-          # No structured counts available without re-running with --json;
-          # leave outputs empty rather than guessing.
-          echo "passed=" >> "${GITHUB_OUTPUT}"
-          echo "failed=" >> "${GITHUB_OUTPUT}"
-        else
-          echo "passed=" >> "${GITHUB_OUTPUT}"
-          echo "failed=" >> "${GITHUB_OUTPUT}"
-        fi
+        # passed / failed: one count per package the verifier reported.
+        # Human output: a "  verify=true|false" line per package (single,
+        # batch) or a "PASS|MISMATCH ... actual=true|false" line
+        # (conformance). JSON output: the "valid" field (single, batch)
+        # or the "actual" field (conformance) of each object.
+        node --input-type=commonjs - "${REPORT}" "${VERIFY_MODE}" "${VERIFY_JSON}" >> "${GITHUB_OUTPUT}" <<'COUNT'
+        const fs = require("node:fs");
+        const [report, mode, json] = process.argv.slice(2);
+        let passed = 0;
+        let failed = 0;
+        for (const line of fs.readFileSync(report, "utf8").split(/\r?\n/)) {
+          let verdict = null;
+          if (json === "true") {
+            if (!line.startsWith("{")) continue;
+            let record;
+            try { record = JSON.parse(line); } catch { continue; }
+            verdict = String(mode === "conformance" ? record.actual : record.valid);
+          } else {
+            const match = mode === "conformance"
+              ? /^(?:PASS|MISMATCH)  .*?  expected=(?:true|false)  actual=(true|false)(?:  \(|$)/.exec(line)
+              : /^  verify=(true|false)$/.exec(line);
+            if (match) verdict = match[1];
+          }
+          if (verdict === "true") passed++;
+          else if (verdict === "false") failed++;
+        }
+        process.stdout.write(`passed=${passed}\nfailed=${failed}\n`);
+        COUNT
 
         exit "${code}"

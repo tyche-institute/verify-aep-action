@@ -1,7 +1,8 @@
 name: Self-test
 
 # Runs the Action from this checkout against the public reference
-# test vectors of tyche-institute/eatf-verifier.
+# test vectors of tyche-institute/eatf-verifier, then checks each
+# step's outcome and its passed / failed / exit-code outputs.
 
 on:
   push:
@@ -26,18 +27,29 @@ jobs:
           path: vectors-src
 
       - name: conformance mode meets the contract on the reference vectors
+        id: conformance
         uses: ./
         with:
           mode: conformance
           path: vectors-src/test-vectors
 
+      - name: conformance mode, JSON output
+        id: conformance-json
+        uses: ./
+        with:
+          mode: conformance
+          json: "true"
+          path: vectors-src/test-vectors
+
       - name: batch mode passes on the valid vectors
+        id: batch-valid
         uses: ./
         with:
           mode: batch
           path: vectors-src/test-vectors/valid
 
       - name: single mode passes on one valid package, JSON output
+        id: single-valid
         uses: ./
         with:
           mode: single
@@ -52,31 +64,77 @@ jobs:
           mode: single
           path: vectors-src/test-vectors/invalid/tampered-canonical-bin/package.aep
 
-      - name: The tampered package must have failed the step
-        shell: bash
-        env:
-          OUTCOME: ${{ steps.tampered.outcome }}
-          EXIT_CODE: ${{ steps.tampered.outputs.exit-code }}
-        run: |
-          echo "outcome=${OUTCOME} exit-code=${EXIT_CODE}"
-          test "${OUTCOME}" = "failure"
-          test "${EXIT_CODE}" = "1"
-
-      - name: batch mode fails when a tree holds rejected packages
+      - name: batch mode fails when a tree holds rejected packages, JSON output
         id: mixed
         continue-on-error: true
         uses: ./
         with:
           mode: batch
+          json: "true"
           path: vectors-src/test-vectors
 
-      - name: The mixed tree must have failed the step
+      - name: Make an RSA public key that signed none of the vectors
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            | openssl pkey -pubout -out "${RUNNER_TEMP}/other-signer.pem"
+
+      - name: signer-key accepts a package whose key is in the pinned list
+        id: key-listed
+        uses: ./
+        with:
+          mode: single
+          signer-key: ${{ runner.temp }}/other-signer.pem:vectors-src/test-vectors/keys/dev-rsa-4096.pem
+          path: vectors-src/test-vectors/valid/minimal-roundtrip/package.aep
+
+      - name: signer-key rejects the same package under another key
+        id: key-other
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: single
+          signer-key: ${{ runner.temp }}/other-signer.pem
+          path: vectors-src/test-vectors/valid/minimal-roundtrip/package.aep
+
+      - name: Outcomes and outputs match the verifier's verdicts
         shell: bash
         env:
-          OUTCOME: ${{ steps.mixed.outcome }}
+          VECTORS: vectors-src/test-vectors
+          # "<outcome> <exit-code>/<passed>/<failed>" of each step above.
+          CONFORMANCE: ${{ steps.conformance.outcome }} ${{ steps.conformance.outputs.exit-code }}/${{ steps.conformance.outputs.passed }}/${{ steps.conformance.outputs.failed }}
+          CONFORMANCE_JSON: ${{ steps.conformance-json.outcome }} ${{ steps.conformance-json.outputs.exit-code }}/${{ steps.conformance-json.outputs.passed }}/${{ steps.conformance-json.outputs.failed }}
+          BATCH_VALID: ${{ steps.batch-valid.outcome }} ${{ steps.batch-valid.outputs.exit-code }}/${{ steps.batch-valid.outputs.passed }}/${{ steps.batch-valid.outputs.failed }}
+          SINGLE_VALID: ${{ steps.single-valid.outcome }} ${{ steps.single-valid.outputs.exit-code }}/${{ steps.single-valid.outputs.passed }}/${{ steps.single-valid.outputs.failed }}
+          TAMPERED: ${{ steps.tampered.outcome }} ${{ steps.tampered.outputs.exit-code }}/${{ steps.tampered.outputs.passed }}/${{ steps.tampered.outputs.failed }}
+          MIXED: ${{ steps.mixed.outcome }} ${{ steps.mixed.outputs.exit-code }}/${{ steps.mixed.outputs.passed }}/${{ steps.mixed.outputs.failed }}
+          KEY_LISTED: ${{ steps.key-listed.outcome }} ${{ steps.key-listed.outputs.exit-code }}/${{ steps.key-listed.outputs.passed }}/${{ steps.key-listed.outputs.failed }}
+          KEY_OTHER: ${{ steps.key-other.outcome }} ${{ steps.key-other.outputs.exit-code }}/${{ steps.key-other.outputs.passed }}/${{ steps.key-other.outputs.failed }}
         run: |
-          echo "outcome=${OUTCOME}"
-          test "${OUTCOME}" = "failure"
+          set -euo pipefail
+          valid=$(find "${VECTORS}/valid" -name '*.aep' | wc -l | tr -d ' ')
+          invalid=$(find "${VECTORS}/invalid" -name '*.aep' | wc -l | tr -d ' ')
+          echo "reference vectors: ${valid} under valid/, ${invalid} under invalid/"
+          test "${valid}" -gt 0
+          test "${invalid}" -gt 0
+          status=0
+          check() {
+            if [[ "$2" == "$3" ]]; then
+              echo "ok    $1: $2"
+            else
+              echo "FAIL  $1: got '$2', expected '$3'"
+              status=1
+            fi
+          }
+          check conformance      "${CONFORMANCE}"      "success 0/${valid}/${invalid}"
+          check conformance-json "${CONFORMANCE_JSON}" "success 0/${valid}/${invalid}"
+          check batch-valid      "${BATCH_VALID}"      "success 0/${valid}/0"
+          check single-valid     "${SINGLE_VALID}"     "success 0/1/0"
+          check tampered         "${TAMPERED}"         "failure 1/0/1"
+          check mixed            "${MIXED}"            "failure 1/${valid}/${invalid}"
+          check key-listed       "${KEY_LISTED}"       "success 0/1/0"
+          check key-other        "${KEY_OTHER}"        "failure 1/0/1"
+          exit "${status}"
 
   legacy-layout:
     # v0.1.x releases of the verifier have separate packages for the
@@ -86,8 +144,23 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: conformance mode on a v0.1.x release, with its own vectors
+        id: legacy
         uses: ./
         with:
           eatf-ref: v0.1.2
           mode: conformance
           path: ${{ runner.temp }}/eatf-verifier/test-vectors
+
+      - name: Outputs count the v0.1.x vectors
+        shell: bash
+        env:
+          VECTORS: ${{ runner.temp }}/eatf-verifier/test-vectors
+          GOT: ${{ steps.legacy.outputs.exit-code }}/${{ steps.legacy.outputs.passed }}/${{ steps.legacy.outputs.failed }}
+        run: |
+          set -euo pipefail
+          valid=$(find "${VECTORS}/valid" -name '*.aep' | wc -l | tr -d ' ')
+          invalid=$(find "${VECTORS}/invalid" -name '*.aep' | wc -l | tr -d ' ')
+          echo "exit-code/passed/failed: got ${GOT}, expected 0/${valid}/${invalid}"
+          test "${valid}" -gt 0
+          test "${invalid}" -gt 0
+          test "${GOT}" = "0/${valid}/${invalid}"
